@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import difflib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -21,8 +22,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from obsidian_wiki.cache import _iter_entries
@@ -152,13 +154,63 @@ def context_pack(
 
 # --- HTTP -------------------------------------------------------------------
 
-def require_key(request: Request) -> None:
-    if ANONYMOUS:
-        return
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_loopback(client_host: str | None) -> bool:
+    try:
+        return ipaddress.ip_address(client_host or "").is_loopback
+    except ValueError:
+        return False
+
+
+def _host_name(host_header: str) -> str:
+    """`localhost:8080` -> `localhost`, `[::1]:8080` -> `::1`."""
+    if host_header.startswith("["):
+        return host_header[1:].partition("]")[0]
+    return host_header.rpartition(":")[0] if host_header.count(":") == 1 else host_header
+
+
+def _authorized(request: Request) -> bool:
+    """A valid key from anywhere, or — with WIKI_ALLOW_ANONYMOUS=1 — no key from
+    this machine only.
+
+    Anonymous access also requires a loopback Host header (a DNS-rebinding page
+    in the user's browser connects from loopback but sends its own hostname) and
+    no forwarding headers (a reverse proxy on this machine makes every remote
+    client look like loopback).
+    """
     header = request.headers.get("authorization", "")
     token = header[7:] if header.lower().startswith("bearer ") else ""
-    if not hmac.compare_digest(token, API_KEY):
+    if API_KEY and hmac.compare_digest(token, API_KEY):
+        return True
+    return (
+        ANONYMOUS
+        and _is_loopback(request.client.host if request.client else None)
+        and _host_name(request.headers.get("host", "")) in _LOOPBACK_HOSTS
+        and "x-forwarded-for" not in request.headers
+        and "forwarded" not in request.headers
+    )
+
+
+def require_key(request: Request) -> None:
+    if not _authorized(request):
         raise HTTPException(401, "missing or invalid API key")
+
+
+class _RequireKey:
+    """ASGI guard for the mounted MCP app: FastAPI dependencies never reach a mount."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and not _authorized(Request(scope)):
+            response = JSONResponse({"detail": "missing or invalid API key"}, status_code=401,
+                                    headers={"WWW-Authenticate": "Bearer"})
+            await response(scope, receive, send)
+            return
+        await self.inner(scope, receive, send)
 
 
 class PageWrite(BaseModel):
@@ -302,7 +354,13 @@ mcp.tool(name="memory_sync", description="Reconcile index.md and hot.md after wr
 
 # Must be built before `mcp.session_manager` exists. Mounted at /mcp below, so
 # its own path is "/". Stateless: no server-side session state to lose on restart.
-_mcp_app = mcp.streamable_http_app(streamable_http_path="/", stateless_http=True)
+# The SDK's own Host check defaults to localhost-only, which answers 421 to every
+# remote agent; _RequireKey does that check instead, for anonymous requests only.
+_mcp_app = mcp.streamable_http_app(
+    streamable_http_path="/",
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @asynccontextmanager
@@ -314,7 +372,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="obsidian-wiki memory", lifespan=lifespan)
-app.mount("/mcp", _mcp_app)
+app.mount("/mcp", _RequireKey(_mcp_app))
 
 
 @app.get("/health")

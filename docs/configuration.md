@@ -311,6 +311,6 @@ skill use. Full guide: [Deployment](deployment.md).
 | Variable | What it does | Default |
 |---|---|---|
 | `WIKI_API_KEY` | Bearer token required on every `/v1/*` and `/mcp` request | *(none — the server refuses to start without it)* |
-| `WIKI_ALLOW_ANONYMOUS` | `1` disables auth entirely. Local development only | *(unset)* |
+| `WIKI_ALLOW_ANONYMOUS` | `1` lets requests from this machine skip the key: loopback client, `localhost`/`127.0.0.1`/`[::1]` Host header, no `X-Forwarded-For`/`Forwarded` header. Everything else still needs the key. Local development only — never behind a reverse proxy on the same host | *(unset)* |
 | `WIKI_PORT` | Port the server listens on | `8080` |
 | `WIKI_HOST` | Interface to bind. The Docker image sets `0.0.0.0`; override only to expose the server deliberately | `127.0.0.1` |

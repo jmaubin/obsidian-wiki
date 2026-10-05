@@ -131,6 +131,91 @@ def test_console_endpoints_need_a_key(client):
         assert client.get(route).status_code == 401
 
 
+_MCP_HEADERS = {
+    "content-type": "application/json",
+    "accept": "application/json, text/event-stream",
+    "mcp-protocol-version": "2025-06-18",
+}
+
+
+def _mcp_post(client, method, params=None, **headers):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    return client.post("/mcp/", json=body, headers={**_MCP_HEADERS, **headers})
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer nope", "nope"])
+def test_mcp_needs_a_key(client, tmp_path, authorization):
+    """`app.mount` bypasses FastAPI dependencies, so /mcp needs its own guard."""
+    client.headers.pop("authorization")
+    headers = {"authorization": authorization} if authorization else {}
+    write = {"name": "memory_write",
+             "arguments": {"title": "Intrusion", "category": "concepts", "content": "x"}}
+    r = _mcp_post(client, "tools/call", write, **headers)
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == "Bearer"
+    assert not (tmp_path / "concepts" / "intrusion.md").exists()
+    assert _mcp_post(client, "tools/list", **headers).status_code == 401
+
+
+@pytest.mark.parametrize("host", ["localhost:8080", "192.168.1.20:8080", "wiki.example.com"])
+def test_mcp_tools_work_with_the_key_from_any_host(client, tmp_path, host):
+    """The SDK's default Host check answered 421 to everything but localhost."""
+    write = {"name": "memory_write",
+             "arguments": {"title": "Raft", "category": "concepts", "content": "x"}}
+    assert _mcp_post(client, "tools/call", write, host=host).status_code == 200
+    assert (tmp_path / "concepts" / "raft.md").exists()
+
+
+@pytest.fixture
+def anonymous(tmp_path, monkeypatch):
+    """A server with WIKI_ALLOW_ANONYMOUS=1 and no key; yields a client factory."""
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(tmp_path))
+    monkeypatch.delenv("WIKI_API_KEY", raising=False)
+    monkeypatch.setenv("WIKI_ALLOW_ANONYMOUS", "1")
+    sys.modules.pop("obsidian_wiki.server", None)
+    server = importlib.import_module("obsidian_wiki.server")
+    clients = []
+
+    def make(client_ip, base_url="http://localhost:8080"):
+        c = TestClient(server.app, base_url=base_url, client=(client_ip, 50000))
+        clients.append(c.__enter__())
+        return c
+
+    yield make
+    for c in clients:
+        c.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("client_ip", ["127.0.0.1", "::1"])
+def test_anonymous_mode_serves_this_machine(anonymous, tmp_path, client_ip):
+    c = anonymous(client_ip)
+    assert c.get("/v1/search", params={"q": "x"}).status_code == 200
+    write = {"name": "memory_write",
+             "arguments": {"title": "Local", "category": "concepts", "content": "x"}}
+    assert _mcp_post(c, "tools/call", write).status_code == 200
+    assert (tmp_path / "concepts" / "local.md").exists()
+
+
+@pytest.mark.parametrize("client_ip, base_url, extra", [
+    ("192.168.1.20", "http://localhost:8080", {}),        # another machine
+    ("127.0.0.1", "http://evil.example:8080", {}),        # DNS rebinding from a browser
+    ("127.0.0.1", "http://localhost:8080",                # reverse proxy on this machine
+     {"x-forwarded-for": "203.0.113.7"}),
+    ("127.0.0.1", "http://localhost:8080", {"forwarded": "for=203.0.113.7"}),
+])
+def test_anonymous_mode_refuses_everything_else(anonymous, client_ip, base_url, extra):
+    c = anonymous(client_ip, base_url)
+    assert c.get("/v1/search", params={"q": "x"}, headers=extra).status_code == 401
+    assert _mcp_post(c, "tools/list", **extra).status_code == 401
+
+
+def test_empty_key_never_matches_an_empty_token(anonymous):
+    """Anonymous mode runs without a key: an empty bearer must not compare equal to it."""
+    c = anonymous("192.168.1.20")
+    assert c.get("/v1/search", params={"q": "x"},
+                 headers={"authorization": "Bearer "}).status_code == 401
+
+
 def test_status_derives_counts_from_the_vault(client, tmp_path):
     _page(tmp_path, "concepts/a.md")
     _page(tmp_path, "concepts/b.md")

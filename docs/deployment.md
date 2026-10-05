@@ -36,7 +36,7 @@ WIKI_API_KEY=dev OBSIDIAN_VAULT_PATH=~/vault python -m obsidian_wiki.server
 |---|---|---|
 | `OBSIDIAN_VAULT_PATH` | Vault the service serves | `/vault` |
 | `WIKI_API_KEY` | Bearer token for every `/v1/*` and `/mcp` request | *(none — required)* |
-| `WIKI_ALLOW_ANONYMOUS` | `1` disables auth entirely. Local development only | *(unset)* |
+| `WIKI_ALLOW_ANONYMOUS` | `1` lets requests from this machine skip the key: loopback client, `localhost`/`127.0.0.1`/`[::1]` Host header, no `X-Forwarded-For`/`Forwarded` header. Everything else still needs the key. Local development only — never behind a reverse proxy on the same host | *(unset)* |
 | `WIKI_PORT` | Port to listen on | `8080` |
 | `WIKI_HOST` | Interface to bind. The Docker image sets `0.0.0.0`; override only to expose the server deliberately | `127.0.0.1` |
 
@@ -60,7 +60,8 @@ For in-process use, `from obsidian_wiki import Memory` skips the server entirely
 
 ## REST
 
-Every route below `/v1` needs `Authorization: Bearer <key>`. `/health` does not.
+Every route below `/v1`, and `/mcp`, needs `Authorization: Bearer <key>`. `/health` and the `/ui`
+shell do not.
 
 | Method | Path | Notes |
 |---|---|---|
