@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 
 import pytest
@@ -179,6 +180,29 @@ def test_mcp_write_accepts_a_path(client, tmp_path):
     assert client.post("/mcp/", json=body, headers=headers).status_code == 200
     text = page.read_text(encoding="utf-8")
     assert text.endswith("via mcp\n") and "type: event" in text
+
+def _mcp_tool_result(client, tool, arguments):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}}
+    headers = {"content-type": "application/json", "accept": "application/json, text/event-stream",
+               "mcp-protocol-version": "2025-06-18", "host": "localhost:8080"}
+    r = client.post("/mcp/", json=body, headers=headers)
+    data = next(l[6:] for l in r.text.splitlines() if l.startswith("data: "))
+    return json.loads(data)["result"]
+
+
+def test_mcp_tool_errors_reach_the_agent(client):
+    """An HTTPException inside a tool used to surface only as "Error executing tool"."""
+    result = _mcp_tool_result(client, "memory_read", {"path": "concepts/missing.md"})
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "404" in text and "concepts/missing.md" in text
+
+
+def test_mcp_tool_errors_carry_the_refusal_reason(client):
+    result = _mcp_tool_result(client, "memory_read", {"path": "../../etc/passwd"})
+    assert result["isError"] is True
+    assert "Error executing tool memory_read:" in result["content"][0]["text"]
 
 
 def test_upsert_false_conflicts(client):

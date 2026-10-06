@@ -11,6 +11,7 @@ Run it with ``python -m obsidian_wiki.server``.
 from __future__ import annotations
 
 import difflib
+import functools
 import hmac
 import ipaddress
 import json
@@ -25,6 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from obsidian_wiki.cache import _iter_entries
@@ -396,9 +398,26 @@ def memory_sync(verb: str = "API_WRITE", takeaways: str = "", **fields: str) -> 
     }
 
 
+def _tool(fn: Any) -> Any:
+    """Expose an HTTP handler as an MCP tool, keeping its refusals readable.
+
+    The SDK shows the agent only "Error executing tool <name>" for an
+    unexpected exception; a `ToolError` keeps its message. The handlers raise
+    HTTPException for expected refusals (missing page, bad path, conflict),
+    so those become ToolErrors and the agent can correct its call.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except HTTPException as exc:
+            raise ToolError(f"{exc.status_code}: {exc.detail}") from exc
+    return wrapper
+
+
 mcp = MCPServer("obsidian-wiki")
-mcp.tool(name="memory_search", description="Search the wiki. Returns ranked pages with summaries.")(search)
-mcp.tool(name="memory_read", description="Read one wiki page as markdown, by vault-relative path.")(read_page)
+mcp.tool(name="memory_search", description="Search the wiki. Returns ranked pages with summaries.")(_tool(search))
+mcp.tool(name="memory_read", description="Read one wiki page as markdown, by vault-relative path.")(_tool(read_page))
 mcp.tool(
     name="memory_write",
     description=(
@@ -407,12 +426,12 @@ mcp.tool(
         "fields are kept, and omitted tags/sources/summary keep their values. Without `path`, "
         "a page is created at <category>/<slug of title>.md. Use category '_raw' for a rough capture."
     ),
-)(write_page)
-mcp.tool(name="memory_context_pack", description="Compile a token-bounded context pack on a topic.")(context_pack)
-mcp.tool(name="memory_recap", description="Owner profile, open threads, and recent activity — call at session start.")(memory_recap)
-mcp.tool(name="memory_profile", description="Read or update durable facts about a person (list|set|forget); user_id scopes them.")(memory_profile)
-mcp.tool(name="memory_todo", description="Read or update threads carried between sessions (list|add|done|drop); user_id scopes them.")(memory_todo)
-mcp.tool(name="memory_sync", description="Reconcile index.md and hot.md after writes, under one lock.")(memory_sync)
+)(_tool(write_page))
+mcp.tool(name="memory_context_pack", description="Compile a token-bounded context pack on a topic.")(_tool(context_pack))
+mcp.tool(name="memory_recap", description="Owner profile, open threads, and recent activity — call at session start.")(_tool(memory_recap))
+mcp.tool(name="memory_profile", description="Read or update durable facts about a person (list|set|forget); user_id scopes them.")(_tool(memory_profile))
+mcp.tool(name="memory_todo", description="Read or update threads carried between sessions (list|add|done|drop); user_id scopes them.")(_tool(memory_todo))
+mcp.tool(name="memory_sync", description="Reconcile index.md and hot.md after writes, under one lock.")(_tool(memory_sync))
 
 
 # Must be built before `mcp.session_manager` exists. Mounted at /mcp below, so
