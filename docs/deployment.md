@@ -67,7 +67,7 @@ Every route below `/v1` needs `Authorization: Bearer <key>`. `/health` does not.
 | `GET` | `/health` | Liveness; also reports whether the vault directory exists |
 | `GET` | `/v1/search?q=&limit=` | Ranked pages with summaries, from the same GraphRAG index the `wiki-query` skill uses |
 | `GET` | `/v1/pages/{path}` | One page as markdown, by vault-relative path |
-| `POST` | `/v1/pages` | `{title, category, content, tags, sources, summary, upsert}` |
+| `POST` | `/v1/pages` | `{title, category, content, tags, sources, summary, upsert, path}` — with `path`, updates that existing page in place |
 | `POST` | `/v1/context-pack` | `{topic, budget, recent, public_only, metadata_only}` |
 | `GET` | `/v1/memory/recap?project=&max_words=&user_id=` | Owner profile, open threads, recent activity |
 | `GET` | `/v1/memory/profile?user_id=` | Durable facts about a person |
@@ -88,6 +88,12 @@ and append a line to `log.md` through the shared memory writer, so an API write 
 parseable like every other operation. `created:` is preserved across updates. Use `category: "_raw"` for a
 rough capture you intend to promote with `wiki-ingest` later — the same role `_raw/` plays for the
 `wiki-capture` skill.
+
+To change an existing page, pass its `path` (from search or read): the file is updated where it
+is, whatever its title, frontmatter fields the API does not manage (`type`, `date`, `lifecycle`…)
+are kept, and omitted `tags` / `sources` / `summary` keep their values. Without `path`, the page
+goes to `<category>/<slug of title>.md`, and an ingested page whose file name differs from its
+title's slug would be duplicated instead of updated. `memory_write` takes the same `path`.
 
 `POST /v1/pages` writes exactly what you send. It does not distil, dedupe, or cross-link — those are
 the agent's job, via the `wiki-capture` and `cross-linker` skills. Call `POST /v1/memory/sync`

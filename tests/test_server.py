@@ -66,6 +66,121 @@ def test_created_date_survives_an_update(client, tmp_path):
     assert (tmp_path / first["path"]).read_text().endswith("two\n")
 
 
+_EVENT_PAGE = """---
+title: >-
+  Field trip to the farm
+category: journal
+type: event
+date: 2026-10-08
+people: [Caleb]
+tags: [family, school]
+sources: [ingest]
+summary: >-
+  Pumpkin picking, morning.
+lifecycle: draft
+provenance:
+  extracted: 1.0
+  inferred: 0.0
+created: 2026-10-05
+updated: 2026-10-05
+---
+
+# Field trip to the farm
+
+Bring boots.
+"""
+
+
+def _event(tmp_path):
+    page = tmp_path / "journal" / "2026-10-05-field-trip.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(_EVENT_PAGE, encoding="utf-8")
+    return page
+
+
+def test_update_by_path_keeps_the_file_whatever_the_title(client, tmp_path):
+    """Ingested files are often named apart from their title's slug."""
+    page = _event(tmp_path)
+    r = client.post("/v1/pages", json={
+        "path": "journal/2026-10-05-field-trip.md",
+        "title": "Field trip to the farm (rescheduled)",
+        "content": "Bring boots and a hat.",
+    })
+    assert r.status_code == 200 and r.json()["path"] == "journal/2026-10-05-field-trip.md"
+    assert sorted(p.name for p in page.parent.iterdir()) == ["2026-10-05-field-trip.md"]
+    text = page.read_text(encoding="utf-8")
+    assert "rescheduled" in text and text.endswith("Bring boots and a hat.\n")
+
+
+def test_update_keeps_frontmatter_fields_it_does_not_manage(client, tmp_path):
+    page = _event(tmp_path)
+    client.post("/v1/pages", json={
+        "path": "journal/2026-10-05-field-trip.md", "title": "Field trip to the farm", "content": "x",
+    })
+    assert page.read_text(encoding="utf-8").endswith("\nx\n")
+    meta = _parse_frontmatter_values(page.read_text(encoding="utf-8"))
+    assert meta["type"] == "event" and meta["date"] == "2026-10-08"
+    assert meta["lifecycle"] == "draft" and meta["created"] == "2026-10-05"
+    assert "provenance:\n  extracted: 1.0\n  inferred: 0.0" in page.read_text(encoding="utf-8")
+    assert meta["category"] == "journal"
+
+
+def test_update_without_tags_sources_or_summary_keeps_them(client, tmp_path):
+    page = _event(tmp_path)
+    client.post("/v1/pages", json={
+        "path": "journal/2026-10-05-field-trip.md", "title": "Field trip to the farm", "content": "x",
+    })
+    text = page.read_text(encoding="utf-8")
+    assert text.endswith("\nx\n")
+    assert "tags: [family, school]" in text and "sources: [ingest]" in text
+    assert "Pumpkin picking, morning." in text
+
+
+def test_update_replaces_tags_when_given(client, tmp_path):
+    page = _event(tmp_path)
+    client.post("/v1/pages", json={
+        "path": "journal/2026-10-05-field-trip.md", "title": "Field trip to the farm",
+        "content": "x", "tags": ["family"],
+    })
+    assert "tags: [family]\n" in page.read_text(encoding="utf-8")
+
+
+def test_update_by_title_keeps_extra_fields_too(client, tmp_path):
+    """The slug path (no `path`) used to drop every field it did not write."""
+    page = tmp_path / "concepts" / "raft.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("---\ntitle: Raft\ncategory: concepts\nstatus: active\n"
+                    "created: 2026-01-01\nupdated: 2026-01-01\n---\n\nold\n", encoding="utf-8")
+    client.post("/v1/pages", json={"title": "Raft", "category": "concepts", "content": "new"})
+    meta = _parse_frontmatter_values(page.read_text(encoding="utf-8"))
+    assert meta["status"] == "active" and meta["created"] == "2026-01-01"
+
+
+@pytest.mark.parametrize("path, code", [
+    ("journal/missing.md", 404),             # update only: never creates at an arbitrary path
+    ("journal/2026-10-05-field-trip", 400),  # not a .md page
+    ("../escape.md", 400),
+])
+def test_update_by_path_refuses_bad_paths(client, tmp_path, path, code):
+    _event(tmp_path)
+    r = client.post("/v1/pages", json={"path": path, "title": "T", "content": "x"})
+    assert r.status_code == code
+    assert not (tmp_path / "journal" / "missing.md").exists()
+
+
+def test_mcp_write_accepts_a_path(client, tmp_path):
+    page = _event(tmp_path)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "memory_write",
+        "arguments": {"path": "journal/2026-10-05-field-trip.md",
+                      "title": "Field trip to the farm", "content": "via mcp"}}}
+    headers = {"content-type": "application/json", "accept": "application/json, text/event-stream",
+               "mcp-protocol-version": "2025-06-18", "host": "localhost:8080"}
+    assert client.post("/mcp/", json=body, headers=headers).status_code == 200
+    text = page.read_text(encoding="utf-8")
+    assert text.endswith("via mcp\n") and "type: event" in text
+
+
 def test_upsert_false_conflicts(client):
     body = {"title": "Paxos", "category": "concepts", "content": "x", "upsert": False}
     assert client.post("/v1/pages", json=body).status_code == 200

@@ -88,34 +88,87 @@ def _folded(key: str, value: str) -> str:
     return f"{key}: >-\n  " + " ".join(str(value).split())
 
 
+_MANAGED_KEYS = ("title", "category", "tags", "sources", "summary", "created", "updated")
+_FRONTMATTER_KEY_RE = re.compile(r"^([A-Za-z_][\w-]*):")
+
+
+def _frontmatter_chunks(text: str) -> dict[str, str]:
+    """Top-level frontmatter keys -> their raw lines, multi-line values included.
+
+    Raw text rather than parsed values, so a field this writer does not manage
+    (`type`, `date`, `lifecycle`, a nested `provenance:` block…) is written
+    back byte for byte instead of being re-serialized or dropped.
+    """
+    if not text.startswith("---\n"):
+        return {}
+    head, sep, _ = text[4:].partition("\n---\n")
+    if not sep:
+        return {}
+    chunks: dict[str, str] = {}
+    key = None
+    for line in head.splitlines():
+        match = _FRONTMATTER_KEY_RE.match(line)
+        if match:
+            key = match.group(1)
+            chunks[key] = line
+        elif key is not None:
+            chunks[key] += "\n" + line
+    return chunks
+
+
+def _chunk_value(chunk: str) -> str:
+    return chunk.split(":", 1)[1].strip()
+
+
 def write_page(
     title: str,
-    category: str,
     content: str,
+    category: str = "concepts",
     *,
     tags: list[str] | None = None,
     sources: list[str] | None = None,
-    summary: str = "",
+    summary: str | None = None,
     upsert: bool = True,
+    path: str = "",
 ) -> dict[str, Any]:
-    rel = f"{_category_slug(category)}/{_slug(title)}.md"
-    target = _resolve(rel)
-    if target.exists() and not upsert:
-        raise HTTPException(409, f"page already exists: {rel}")
+    """Create a page from title + category, or update the existing page at `path`.
+
+    On update, fields this writer does not manage are kept as they are, and
+    omitted `tags` / `sources` / `summary` keep their current values.
+    """
+    if path:
+        rel = path.strip().lstrip("/")
+        if not rel.endswith(".md"):
+            raise HTTPException(400, f"path must name a .md page: {rel}")
+        target = _resolve(rel)
+        if not target.is_file():
+            raise HTTPException(404, f"no page at {rel}; omit path to create a new page")
+    else:
+        rel = f"{_category_slug(category)}/{_slug(title)}.md"
+        target = _resolve(rel)
+        if target.exists() and not upsert:
+            raise HTTPException(409, f"page already exists: {rel}")
+    existing = _frontmatter_chunks(target.read_text(encoding="utf-8")) if target.exists() else {}
     today = date.today().isoformat()
-    created = today
-    if target.exists():
-        # Preserve the original created: date across updates.
-        match = re.search(r"^created:\s*(\S+)", target.read_text(encoding="utf-8"), re.MULTILINE)
-        created = match.group(1) if match else today
+    # Preserve the original created: date across updates.
+    created = _chunk_value(existing["created"]) if "created" in existing else today
+    if path:
+        category_line = existing.get("category") or f"category: {rel.split('/')[0]}"
+    else:
+        category_line = f"category: {_category_slug(category)}"
+
+    def managed(key: str, given: Any, render: str) -> str:
+        return existing[key] if given is None and key in existing else render
+
     front = "\n".join(
         [
             "---",
             _folded("title", title),
-            f"category: {_category_slug(category)}",
-            "tags: [" + ", ".join(tags or []) + "]",
-            "sources: [" + ", ".join(sources or []) + "]",
-            _folded("summary", summary) if summary else "summary:",
+            category_line,
+            managed("tags", tags, "tags: [" + ", ".join(tags or []) + "]"),
+            managed("sources", sources, "sources: [" + ", ".join(sources or []) + "]"),
+            managed("summary", summary, _folded("summary", summary) if summary else "summary:"),
+            *(chunk for key, chunk in existing.items() if key not in _MANAGED_KEYS),
             f"created: {created}",
             f"updated: {today}",
             "---",
@@ -165,10 +218,12 @@ class PageWrite(BaseModel):
     title: str
     category: str = "concepts"
     content: str
-    tags: list[str] = Field(default_factory=list)
-    sources: list[str] = Field(default_factory=list)
-    summary: str = ""
+    # None keeps the current value when updating an existing page.
+    tags: list[str] | None = None
+    sources: list[str] | None = None
+    summary: str | None = None
     upsert: bool = True
+    path: str = ""
 
 
 class PackRequest(BaseModel):
@@ -292,7 +347,15 @@ def memory_sync(verb: str = "API_WRITE", takeaways: str = "", **fields: str) -> 
 mcp = MCPServer("obsidian-wiki")
 mcp.tool(name="memory_search", description="Search the wiki. Returns ranked pages with summaries.")(search)
 mcp.tool(name="memory_read", description="Read one wiki page as markdown, by vault-relative path.")(read_page)
-mcp.tool(name="memory_write", description="Write a wiki page. Use category '_raw' for a rough capture.")(write_page)
+mcp.tool(
+    name="memory_write",
+    description=(
+        "Write a wiki page. To change an existing page, pass its `path` (as returned by "
+        "memory_search or memory_read): the file is updated in place, its other frontmatter "
+        "fields are kept, and omitted tags/sources/summary keep their values. Without `path`, "
+        "a page is created at <category>/<slug of title>.md. Use category '_raw' for a rough capture."
+    ),
+)(write_page)
 mcp.tool(name="memory_context_pack", description="Compile a token-bounded context pack on a topic.")(context_pack)
 mcp.tool(name="memory_recap", description="Owner profile, open threads, and recent activity — call at session start.")(memory_recap)
 mcp.tool(name="memory_profile", description="Read or update durable facts about a person (list|set|forget); user_id scopes them.")(memory_profile)
@@ -335,8 +398,9 @@ def http_read(path: str) -> dict[str, Any]:
 @app.post("/v1/pages", dependencies=[Depends(require_key)])
 def http_write(body: PageWrite) -> dict[str, Any]:
     return write_page(
-        body.title, body.category, body.content,
-        tags=body.tags, sources=body.sources, summary=body.summary, upsert=body.upsert,
+        body.title, body.content, body.category,
+        tags=body.tags, sources=body.sources, summary=body.summary,
+        upsert=body.upsert, path=body.path,
     )
 
 
